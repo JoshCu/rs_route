@@ -97,7 +97,7 @@ checksum = "5c8214115b7bf84099f1309324e63141d4c5d7cc26862f97a0a857dbefe165bd"
 [[package]]
 name = "bmi-core"
 version = "0.2.0"
-source = "git+https://github.com/JoshCu/bmi-driver?branch=claude%2Fbmi-driver-refactor-lonq01#5bc3f0eb0d2c7163bd72d69f9d14abce8bf123ec"
+source = "git+https://github.com/JoshCu/bmi-driver?branch=claude%2Fbmi-driver-refactor-lonq01#faa859aa9a965faad44c171a75f9906dc558b4ae"
 dependencies = [
  "pyo3",
  "serde",
@@ -107,7 +107,7 @@ dependencies = [
 [[package]]
 name = "bmi-driver"
 version = "0.2.0"
-source = "git+https://github.com/JoshCu/bmi-driver?branch=claude%2Fbmi-driver-refactor-lonq01#5bc3f0eb0d2c7163bd72d69f9d14abce8bf123ec"
+source = "git+https://github.com/JoshCu/bmi-driver?branch=claude%2Fbmi-driver-refactor-lonq01#faa859aa9a965faad44c171a75f9906dc558b4ae"
 dependencies = [
  "bmi-core",
  "netcdf",

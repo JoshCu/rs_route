@@ -61,6 +61,9 @@ cargo build --release
 
 # Run routing on a NextGen output directory
 cargo run --release -- <path/to/ngen-run-directory>
+
+# Build with in-process catchment models (see below)
+cargo build --release --features bmi
 ```
 
 ### CLI Options
@@ -77,6 +80,30 @@ Options:
                                        [possible values: route-rs, t-route-modernized,
                                        t-route-legacy, c-muskingum-cunge]
 ```
+
+### Running the catchment models directly
+
+With the `bmi` feature, rs-route can run the catchment models itself through
+[bmi-driver](https://github.com/JoshCu/bmi-driver) rather than reading the CSV files they would
+have written:
+
+```bash
+rs-route <route_dir> --bmi-dir <bmi_data_dir>
+```
+
+`<bmi_data_dir>` is a bmi-driver data directory -- the one holding `config/`, `forcings/` and the
+model libraries. Nothing is written to disk between the models and the router, and the units of
+the routed variable come from the models rather than being assumed. `--bmi-config` points at a
+realization config other than `<bmi_data_dir>/config/realization.json`, and `--flow-variable`
+selects a model output other than `Q_OUT` (it applies to the CSV path too).
+
+Each worker thread runs its own copy of the models. That is safe for models keeping their state
+in the instance the registration function allocates, and unsafe for anything using Fortran `save`
+variables or C file-scope statics -- those instances will quietly share state. Use `-n 1`, or the
+CSV path, if you are unsure which kind you have.
+
+The `bmi-python` feature adds Python BMI models, and needs Python development headers at build
+time.
 
 ### Expected directory structure
 
@@ -97,6 +124,14 @@ cargo test
 ```
 
 A small test dataset is included in `tests/one_cat/` for integration testing.
+
+```bash
+cargo test --features bmi
+```
+
+also runs the in-process model tests, which compile a synthetic BMI model
+(`tests/fixtures/bucket_bmi.c`) during the test run and check that routing through a CSV file and
+routing the models directly agree. They need a C compiler and nothing else.
 
 ## License
 

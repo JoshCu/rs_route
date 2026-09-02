@@ -102,6 +102,10 @@ impl FlowSource {
 }
 
 /// A thread-local handle that turns a node id into its lateral inflow series.
+///
+/// The BMI variant is much larger than the CSV one, which is fine: exactly one of these exists
+/// per worker thread and it lives for the whole run, so there is nothing to gain from boxing it.
+#[allow(clippy::large_enum_variant)]
 pub enum FlowProvider {
     Csv {
         dir: PathBuf,
