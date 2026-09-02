@@ -13,17 +13,15 @@ pub struct NetworkNode {
     pub id: u32,
     pub downstream_id: u32,
     pub area_sqkm: Option<f32>,
-    pub qlat_file: PathBuf,
     pub inflow_storage: Arc<Mutex<VecDeque<f32>>>,
 }
 
 impl NetworkNode {
-    pub fn new(id: u32, downstream_id: u32, area_sqkm: Option<f32>, qlat_file: PathBuf) -> Self {
+    pub fn new(id: u32, downstream_id: u32, area_sqkm: Option<f32>) -> Self {
         NetworkNode {
             id,
             downstream_id,
             area_sqkm,
-            qlat_file,
             inflow_storage: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -44,14 +42,8 @@ impl NetworkTopology {
         }
     }
 
-    pub fn add_node(
-        &mut self,
-        id: u32,
-        downstream_id: u32,
-        area_sqkm: Option<f32>,
-        qlat_file: PathBuf,
-    ) {
-        let node = NetworkNode::new(id, downstream_id, area_sqkm, qlat_file);
+    pub fn add_node(&mut self, id: u32, downstream_id: u32, area_sqkm: Option<f32>) {
+        let node = NetworkNode::new(id, downstream_id, area_sqkm);
         self.nodes.insert(id, node);
     }
 
@@ -63,11 +55,7 @@ impl NetworkTopology {
 }
 
 // Function to build network topology from database
-pub fn build_network_topology(
-    conn: &Connection,
-    config: &ColumnConfig,
-    csv_dir: &PathBuf,
-) -> Result<NetworkTopology> {
+pub fn build_network_topology(conn: &Connection, config: &ColumnConfig) -> Result<NetworkTopology> {
     let mut topology = NetworkTopology::new();
 
     let network_query = format!(
@@ -101,8 +89,7 @@ pub fn build_network_topology(
             .and_then(|s| s.parse::<u32>().ok())
             .ok_or_else(|| anyhow::anyhow!("Invalid toID format: {}", downstream_id))?;
 
-        let qlat_file_path = csv_dir.join(format!("cat-{}.csv", n_id));
-        topology.add_node(n_id, n_downstream_id, Some(area_sqkm), qlat_file_path);
+        topology.add_node(n_id, n_downstream_id, Some(area_sqkm));
     }
 
     // Build upstream connections
@@ -173,16 +160,14 @@ pub fn load_channel_parameters(
 pub fn load_network(
     db_path: &PathBuf,
     config: &ColumnConfig,
-    csv_dir: &PathBuf,
 ) -> Result<(NetworkTopology, FxHashMap<u32, ChannelParams>)> {
     let topology_handle = {
         let db_path = db_path.clone();
-        let csv_dir = csv_dir.clone();
         let config = config.clone();
         thread::spawn(move || -> Result<NetworkTopology> {
             let conn = Connection::open(&db_path)
                 .with_context(|| format!("Failed to open database: {:?}", db_path))?;
-            build_network_topology(&conn, &config, &csv_dir)
+            build_network_topology(&conn, &config)
         })
     };
     let params_handle = {

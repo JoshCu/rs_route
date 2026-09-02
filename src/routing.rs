@@ -1,5 +1,5 @@
 use crate::config::ChannelParams;
-use crate::io::csv::load_external_flows;
+use crate::io::flows::{FlowProvider, FlowSource};
 use crate::io::netcdf::write_batch;
 use crate::io::results::SimulationResults;
 use crate::kernel::muskingum::{MuskingumCungeInput, MuskingumCungeKernel, MuskingumCungeResult};
@@ -38,6 +38,7 @@ fn process_node_all_timesteps(
     channel_params: &ChannelParams,
     max_timesteps: usize,
     dt: f32,
+    flows: &mut FlowProvider,
 ) -> Result<SimulationResults> {
     let node = topology
         .nodes
@@ -50,8 +51,7 @@ fn process_node_all_timesteps(
         .area_sqkm
         .ok_or_else(|| anyhow::anyhow!("Node {} has no area defined", node_id))?;
 
-    let mut external_flows =
-        load_external_flows(node.qlat_file.clone(), &node.id, Some(&"Q_OUT"), area)?;
+    let mut external_flows = flows.load(node.id, area)?;
 
     let s0 = if channel_params.s0 == 0.0 {
         0.00001
@@ -82,10 +82,10 @@ fn process_node_all_timesteps(
         // Only a single external flow value breaks the upsampling logic,
         // so we throw an error if the file only contains one value (which is likely a mistake)
         return Err(anyhow::anyhow!(
-            "External flow file for node {} only contains one value, which is not sufficient for routing. Please check the file: {:?}",
-            node_id,
-            node.qlat_file
-        )).with_context(|| format!("Failed to load external flows for node {}: {:?}", node_id, node.qlat_file));
+            "External flows for node {} contain only one value, which is not sufficient for routing.",
+            node_id
+        ))
+        .with_context(|| format!("Failed to load external flows for node {}", node_id));
     }
 
     let mut qup = 0.0;
@@ -301,6 +301,7 @@ fn downsample_results(results: SimulationResults, downsampling: usize) -> Simula
 }
 
 // Worker thread - now just receives work and processes it
+#[allow(clippy::too_many_arguments)]
 fn worker_thread(
     kernel: MuskingumCungeKernel,
     work_rx: Receiver<WorkerMessage>,
@@ -312,7 +313,12 @@ fn worker_thread(
     downsampling: usize,
     writer_tx: Sender<WriterMessage>,
     progress_bar: Arc<ProgressBar>,
+    flow_source: FlowSource,
 ) -> Result<()> {
+    // Built here rather than passed in: a BMI provider owns dynamically loaded model libraries
+    // and is not Send, so each worker needs its own.
+    let mut flows = flow_source.provider()?;
+
     loop {
         match work_rx.recv() {
             Ok(WorkerMessage::ProcessNode(node_id)) => {
@@ -325,6 +331,7 @@ fn worker_thread(
                         params,
                         max_timesteps,
                         dt,
+                        &mut flows,
                     ) {
                         Ok(results) => {
                             // Pass full-resolution flow to downstream node
@@ -396,6 +403,7 @@ fn worker_thread(
 }
 
 // Main parallel routing function
+#[allow(clippy::too_many_arguments)]
 pub fn process_routing_parallel(
     kernel: MuskingumCungeKernel,
     topology: Arc<NetworkTopology>,
@@ -406,6 +414,7 @@ pub fn process_routing_parallel(
     output_file: Arc<Mutex<FileMut>>,
     progress_bar: Arc<ProgressBar>,
     num_threads: usize,
+    flow_source: FlowSource,
 ) -> Result<()> {
     let total_nodes = topology.nodes.len();
     let topology_arc = topology;
@@ -434,6 +443,7 @@ pub fn process_routing_parallel(
         let writer = writer_tx.clone();
         let scheduler = scheduler_tx.clone();
         let pb = Arc::clone(&progress_bar);
+        let source = flow_source.clone();
 
         let handle = thread::spawn(move || {
             if let Err(e) = worker_thread(
@@ -447,6 +457,7 @@ pub fn process_routing_parallel(
                 downsampling,
                 writer,
                 pb,
+                source,
             ) {
                 eprintln!("Worker {} error: {}", i, e);
             }

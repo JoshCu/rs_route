@@ -8,15 +8,26 @@ license = "MIT"
 [build-dependencies]
 anyhow = "1.0.98"
 
+[lib]
+name = "rs_route"
+path = "src/lib.rs"
+
 [[bin]]
 name = "rs-route"
 path = "src/main.rs"
 
 [features]
 static = ["netcdf/static", "rusqlite/bundled"]
+# Run the catchment models in process via bmi-driver instead of reading their CSV output.
+bmi = ["dep:bmi-driver"]
+# BMI models written in Python. Needs Python development headers at build time.
+bmi-python = ["bmi", "bmi-driver/python-embed"]
 
 [dependencies]
 anyhow = "1.0.98"
+# default-features = false keeps bmi-driver's own rusqlite out of the build: this crate already
+# reads the GeoPackage itself, and two rusqlite versions cannot coexist (libsqlite3-sys `links`).
+bmi-driver = { git = "https://github.com/JoshCu/bmi-driver", branch = "claude/bmi-driver-refactor-lonq01", default-features = false, features = ["fortran"], optional = true }
 chrono = "0.4.41"
 clap = { version = "4.5.38", features = ["color", "derive", "string"] }
 colored = "3.1.1"
@@ -27,6 +38,9 @@ num_cpus = "1.16.0"
 rusqlite = "0.35.0"
 rustc-hash = "2.1.3"
 serde = "1.0.219"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

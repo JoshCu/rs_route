@@ -1,3 +1,4 @@
+use crate::io::flows::FlowSource;
 use crate::kernel::muskingum::MuskingumCungeKernel;
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -18,6 +19,24 @@ struct Args {
     /// Path to the input directory containing CSV files
     #[arg(short = 'i', long)]
     input_dir: Option<PathBuf>,
+
+    /// Run the catchment models directly instead of reading CSV files.
+    ///
+    /// Takes a bmi-driver data directory (the one holding config/, forcings/ and the model
+    /// libraries). Nothing is written to disk between the models and the router.
+    #[cfg(feature = "bmi")]
+    #[arg(long, value_name = "DATA_DIR")]
+    bmi_dir: Option<PathBuf>,
+
+    /// Realization config to use with --bmi-dir.
+    /// Defaults to <DATA_DIR>/config/realization.json.
+    #[cfg(feature = "bmi")]
+    #[arg(long, value_name = "FILE", requires = "bmi_dir")]
+    bmi_config: Option<PathBuf>,
+
+    /// Model output variable to route.
+    #[arg(long, value_name = "NAME", default_value = "Q_OUT")]
+    flow_variable: String,
 
     /// Path to the output directory
     #[arg(short, long)]
@@ -40,15 +59,29 @@ pub fn print_banner(config: &Config) {
         "  GeoPackage: {}",
         config.gpkg_file.display().to_string().dimmed()
     );
+    match &config.flow_source {
+        FlowSource::Csv { dir, .. } => {
+            eprintln!("  Inflows:  {}", dir.display().to_string().dimmed())
+        }
+        #[cfg(feature = "bmi")]
+        FlowSource::Bmi {
+            data_dir, variable, ..
+        } => eprintln!(
+            "  Inflows:  {} {}",
+            format!("bmi-driver {}", variable).green(),
+            data_dir.display().to_string().dimmed()
+        ),
+    }
     eprintln!();
 }
 pub struct Config {
-    pub csv_dir: PathBuf,
     pub gpkg_file: PathBuf,
     pub internal_timestep_seconds: usize,
     pub output_dir: PathBuf,
     pub kernel: MuskingumCungeKernel,
     pub num_threads: usize,
+    /// Where lateral inflows come from: CSV files, or the catchment models run in process.
+    pub flow_source: FlowSource,
 }
 
 pub fn get_args() -> Result<Config> {
@@ -68,11 +101,33 @@ pub fn get_args() -> Result<Config> {
         .with_context(|| format!("Failed to access root directory: {:?}", root_dir));
     }
 
-    let dirs_to_check: Vec<&PathBuf> = if args.hf.is_some() {
-        vec![&csv_dir, &output_dir]
-    } else {
-        vec![&csv_dir, &config_dir, &output_dir]
+    #[cfg(feature = "bmi")]
+    let flow_source = match &args.bmi_dir {
+        Some(data_dir) => FlowSource::Bmi {
+            data_dir: data_dir.clone(),
+            config: args.bmi_config.clone(),
+            variable: args.flow_variable.clone(),
+        },
+        None => FlowSource::Csv {
+            dir: csv_dir.clone(),
+            variable: Some(args.flow_variable.clone()),
+        },
     };
+    #[cfg(not(feature = "bmi"))]
+    let flow_source = FlowSource::Csv {
+        dir: csv_dir.clone(),
+        variable: Some(args.flow_variable.clone()),
+    };
+
+    // The CSV directory only has to exist when it is what we are reading from.
+    let reads_csv = matches!(flow_source, FlowSource::Csv { .. });
+    let mut dirs_to_check: Vec<&PathBuf> = vec![&output_dir];
+    if reads_csv {
+        dirs_to_check.push(&csv_dir);
+    }
+    if args.hf.is_none() {
+        dirs_to_check.push(&config_dir);
+    }
     let mut missing_dirs = Vec::new();
     for dir in dirs_to_check {
         if !dir.exists() || !dir.is_dir() {
@@ -106,12 +161,12 @@ pub fn get_args() -> Result<Config> {
             .path()
     };
     let cfg = Config {
-        csv_dir,
         gpkg_file,
         internal_timestep_seconds: args.internal_timestep_seconds,
         output_dir,
         kernel: args.kernel,
         num_threads: args.num_threads,
+        flow_source,
     };
     print_banner(&cfg);
     Ok(cfg)

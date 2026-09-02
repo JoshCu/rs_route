@@ -1,0 +1,430 @@
+//! Muskingum-Cunge routing over an ngen hydrofabric.
+//!
+//! The binary is a thin wrapper over [`run_routing`]; everything it does is available here so
+//! the routing can be driven from another program or exercised by integration tests.
+
+use anyhow::{Context, Result};
+use chrono::Duration;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::Arc;
+
+pub mod cli;
+pub mod config;
+pub mod io;
+pub mod network;
+pub mod routing;
+pub mod kernel {
+    pub mod muskingum;
+}
+
+use config::{ColumnConfig, OutputFormat};
+use io::netcdf::init_netcdf_output;
+use routing::process_routing_parallel;
+
+static OUTPUT_TYPE: &str = "NetCDF"; // or "CSV" or "Both"
+
+pub fn run_routing(config: cli::Config, quiet: bool) -> Result<()> {
+    let dt: f32 = config.internal_timestep_seconds as f32;
+    let db_path: std::path::PathBuf = config.gpkg_file.clone();
+    // let output_format: OutputFormat = OutputFormat::NetCdf;
+    let output_format: OutputFormat = match OUTPUT_TYPE {
+        "CSV" => OutputFormat::Csv,
+        "NetCDF" => OutputFormat::NetCdf,
+        "Both" => OutputFormat::Both,
+        _ => return Err(anyhow::anyhow!("Invalid output type: {}", OUTPUT_TYPE)),
+    };
+
+    let column_config = ColumnConfig::new();
+
+    // Build network topology and load channel parameters
+    println!("Building network topology and loading channel parameters...");
+    let (topology, channel_params_map) = network::load_network(&db_path, &column_config)?;
+
+    // Set up CSV output if needed
+    let csv_writer = if matches!(output_format, OutputFormat::Csv | OutputFormat::Both) {
+        Some(io::csv::create_csv_writer("network_routing_results.csv")?)
+    } else {
+        None
+    };
+
+    // Get simulation parameters
+    let sample_id = *channel_params_map
+        .keys()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No features found"))?;
+    let (max_external_steps, reference_time) = config.flow_source.simulation_span(sample_id)?;
+
+    let start_time = reference_time;
+    let end_time = start_time + Duration::seconds((3600 * max_external_steps) as i64);
+
+    let external_timestep_seconds = 3600;
+    let downsampling = external_timestep_seconds / config.internal_timestep_seconds;
+    let total_timesteps = max_external_steps * downsampling;
+
+    println!("\nSimulation Configuration:");
+    println!("  Period: {} to {}", start_time, end_time);
+    println!(
+        "  Internal timestep: {} seconds",
+        config.internal_timestep_seconds
+    );
+    println!("  Network nodes: {}", topology.nodes.len());
+    println!("  Total timesteps: {}", total_timesteps);
+
+    // Initialize NetCDF output
+    // skip the 0th timestep
+    let timesteps: Vec<f64> = (1..=max_external_steps)
+        .map(|step| (step * external_timestep_seconds) as f64)
+        .collect();
+
+    let nc_filename = format!("troute_output_{}.nc", reference_time.format("%Y%m%d%H%M"));
+    let netcdf_writer = init_netcdf_output(
+        config.output_dir.clone(),
+        &nc_filename,
+        topology.nodes.len(),
+        timesteps,
+        &reference_time,
+    )?;
+
+    // Create progress bar
+    let pb = ProgressBar::new(topology.nodes.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} nodes ({eta})")?
+            .progress_chars("#>-")
+    );
+    if quiet {
+        pb.set_draw_target(indicatif::ProgressDrawTarget::hidden());
+    }
+
+    // Run parallel routing
+    println!("\nStarting parallel wave-front routing...");
+    process_routing_parallel(
+        config.kernel,
+        Arc::new(topology),
+        Arc::new(channel_params_map),
+        total_timesteps,
+        dt,
+        downsampling,
+        netcdf_writer,
+        Arc::new(pb),
+        config.num_threads,
+        config.flow_source,
+    )?;
+
+    // Final flush for CSV
+    if let Some(mut wtr) = csv_writer {
+        wtr.flush().context("Failed to flush CSV writer")?;
+        println!("CSV results saved to network_routing_results.csv");
+    }
+
+    println!(
+        "\nNetwork routing complete. Output saved to {}",
+        nc_filename
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::NaiveDateTime;
+    use crate::kernel::muskingum;
+    use crate::kernel::muskingum::MuskingumCungeKernel;
+
+    // Same-file tests for main file
+    use super::*;
+
+    // Can't easily test the full routing process without
+    // creating test data, but we can use the included ./tests/one_cat/ dataset
+    // to test for expected results
+
+    fn setup_test_config() -> cli::Config {
+        cli::Config {
+            gpkg_file: std::path::PathBuf::from("./tests/one_cat/config/cat-486888_subset.gpkg"),
+            internal_timestep_seconds: 300,
+            output_dir: std::path::PathBuf::from("./tests/one_cat/outputs/troute"),
+            kernel: muskingum::MuskingumCungeKernel::TRouteModernized,
+            num_threads: 1,
+            flow_source: csv_source("./tests/one_cat/outputs/ngen"),
+        }
+    }
+
+    fn csv_source(dir: &str) -> crate::io::flows::FlowSource {
+        crate::io::flows::FlowSource::Csv {
+            dir: std::path::PathBuf::from(dir),
+            variable: Some("Q_OUT".to_string()),
+        }
+    }
+
+    // Test get_simulation_params with the included test dataset
+
+    fn sample_feature_id(config: &cli::Config) -> u32 {
+        let conn = rusqlite::Connection::open(&config.gpkg_file).unwrap();
+        let column_config = ColumnConfig::new();
+        let params = network::load_channel_parameters(&conn, &column_config).unwrap();
+        *params.keys().next().unwrap()
+    }
+
+    #[test]
+    fn test_get_simulation_params() {
+        // The CSV file's row count and first timestamp define the simulation period.
+        let config: cli::Config = setup_test_config();
+        let id = sample_feature_id(&config);
+
+        let (max_external_steps, reference_time) =
+            config.flow_source.simulation_span(id).unwrap();
+
+        assert_eq!(max_external_steps, 24);
+        assert_eq!(
+            reference_time,
+            NaiveDateTime::parse_from_str("2010-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_invalid_csv_file() {
+        // A missing CSV directory is reported, not silently treated as an empty run.
+        let config: cli::Config = setup_test_config();
+        let id = sample_feature_id(&config);
+
+        let source = csv_source("./tests/one_cat/outputs/invalid_csv");
+        let result: std::result::Result<(usize, NaiveDateTime), anyhow::Error> =
+            source.simulation_span(id);
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Failed to read file:")
+        );
+    }
+
+    #[test]
+    fn test_invalid_feature() {
+        // An id with no corresponding CSV file is reported rather than assumed to be zero flow.
+        let config: cli::Config = setup_test_config();
+        let result = config.flow_source.simulation_span(999999);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Failed to read file:")
+        );
+    }
+
+    // Do basic test for run_routing with the included test dataset, just to check that it runs without error and produces output files
+    // Ideally we want to fail if any part of the routing process fails
+
+    #[test]
+    fn test_run_routing() {
+        let tmp_dir = std::env::temp_dir().join("rs_route_test_run_routing");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config = cli::Config {
+            output_dir: tmp_dir.clone(),
+            ..setup_test_config()
+        };
+        let result = run_routing(config, true);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        assert!(result.is_ok());
+    }
+
+    fn make_test_input() -> muskingum::MuskingumCungeInput {
+        muskingum::MuskingumCungeInput {
+            dt: 300.0,
+            qup: 5.0,
+            quc: 6.0,
+            qdp: 4.5,
+            ql: 0.5,
+            dx: 5000.0,
+            bw: 10.0,
+            tw: 100.0,
+            tw_cc: 120.0,
+            n: 0.06,
+            n_cc: 0.12,
+            cs: 1.0,
+            s0: 0.001,
+            velp: 0.0,
+            depthp: 0.5,
+        }
+    }
+
+    fn assert_results_close(
+        a: &muskingum::MuskingumCungeResult,
+        b: &muskingum::MuskingumCungeResult,
+        tolerance: f32,
+        label: &str,
+    ) {
+        let flow_diff = if a.qdc == 0.0 && b.qdc == 0.0 {
+            0.0
+        } else {
+            ((a.qdc - b.qdc) / a.qdc).abs()
+        };
+        let vel_diff = if a.velc == 0.0 && b.velc == 0.0 {
+            0.0
+        } else {
+            ((a.velc - b.velc) / a.velc).abs()
+        };
+        let depth_diff = if a.depthc == 0.0 && b.depthc == 0.0 {
+            0.0
+        } else {
+            ((a.depthc - b.depthc) / a.depthc).abs()
+        };
+
+        assert!(
+            flow_diff < tolerance,
+            "{}: flow differs by {:.1}% (got {}, expected {})",
+            label,
+            flow_diff * 100.0,
+            b.qdc,
+            a.qdc,
+        );
+        assert!(
+            vel_diff < tolerance,
+            "{}: velocity differs by {:.1}% (got {}, expected {})",
+            label,
+            vel_diff * 100.0,
+            b.velc,
+            a.velc,
+        );
+        assert!(
+            depth_diff < tolerance,
+            "{}: depth differs by {:.1}% (got {}, expected {})",
+            label,
+            depth_diff * 100.0,
+            b.depthc,
+            a.depthc,
+        );
+    }
+
+    /// The two Fortran kernels (modernized and legacy) should produce
+    /// near-identical results for a single timestep.
+    #[test]
+    fn test_kernel_equivalence_fortran_kernels() {
+        let input = make_test_input();
+        let f_mod = MuskingumCungeKernel::TRouteModernized.exec(&input, false);
+        let f_leg = MuskingumCungeKernel::TRouteLegacy.exec(&input, false);
+        let tolerance = 0.0001; //0.01%
+
+        assert_results_close(&f_mod, &f_leg, tolerance, "Fortran Modernized vs Legacy");
+    }
+
+    /// The Rust kernel should closely match the Fortran kernels.
+    #[test]
+    fn test_kernel_equivalence_rust_vs_fortran() {
+        let input = make_test_input();
+        let rs = MuskingumCungeKernel::RouteRs.exec(&input, false);
+        let f_mod = MuskingumCungeKernel::TRouteModernized.exec(&input, false);
+        let tolerance = 0.0001; //0.01%
+        assert_results_close(&rs, &f_mod, tolerance, "RouteRs vs TRouteModernized");
+    }
+
+    /// The C kernel uses double precision internally and a different secant method
+    /// structure, so it can diverge more than the other three. This test documents
+    /// the current level of divergence without enforcing a tight tolerance.
+    #[test]
+    fn test_c_kernel_produces_output() {
+        let input = make_test_input();
+        let result = MuskingumCungeKernel::CMuskingumCunge.exec(&input, false);
+
+        // Should produce non-zero, positive results
+        assert!(
+            result.qdc > 0.0,
+            "C kernel flow should be positive, got {}",
+            result.qdc
+        );
+        assert!(
+            result.velc > 0.0,
+            "C kernel velocity should be positive, got {}",
+            result.velc
+        );
+        assert!(
+            result.depthc > 0.0,
+            "C kernel depth should be positive, got {}",
+            result.depthc
+        );
+    }
+
+    /// Run each kernel through the full test routing dataset, writing to
+    /// separate temp directories to avoid file conflicts.
+    #[test]
+    fn test_kernel_equivalence_full_routing() {
+        let kernels = [
+            MuskingumCungeKernel::RouteRs,
+            MuskingumCungeKernel::TRouteModernized,
+            MuskingumCungeKernel::TRouteLegacy,
+        ];
+        let mut flow_sums: Vec<(MuskingumCungeKernel, f64)> = Vec::new();
+
+        for kernel in kernels {
+            let tmp_dir = std::env::temp_dir().join(format!("rs_route_test_{:?}", kernel));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+
+            let config = cli::Config {
+                kernel,
+                output_dir: tmp_dir.clone(),
+                ..setup_test_config()
+            };
+            let result = run_routing(config, true);
+            assert!(
+                result.is_ok(),
+                "Kernel {:?} failed: {:?}",
+                kernel,
+                result.err()
+            );
+
+            // Read back the output NetCDF to get total flow
+            let nc_path = tmp_dir.join("troute_output_201001010000.nc");
+            println!("{}", nc_path.display());
+            let file = netcdf::open(&nc_path).unwrap();
+            let flow_var = file.variable("flow").unwrap();
+            let flow_data = flow_var.get::<f32, _>(..).unwrap();
+            let total_flow: f64 = flow_data.iter().map(|&v| v as f64).sum();
+            flow_sums.push((kernel, total_flow));
+
+            // Cleanup
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        let tolerance = 0.0001; //0.01% relative tolerance
+        let (ref_name, ref_flow) = flow_sums[0];
+        for &(name, flow) in &flow_sums[1..] {
+            let diff = ((flow - ref_flow) / ref_flow).abs();
+            assert!(
+                diff < tolerance,
+                "{:?} vs {:?}: total flow differs by {:.1}% ({} vs {})",
+                name,
+                ref_name,
+                diff * 100.0,
+                flow,
+                ref_flow,
+            );
+        }
+    }
+
+    #[test]
+    fn test_run_invalid_config() {
+        // Test that run_routing returns an error when given an invalid configuration (e.g. non-existent database file)
+        let invalid_config = cli::Config {
+            gpkg_file: std::path::PathBuf::from(
+                "./tests/invalid_test/config/cat-486888_subset.gpkg",
+            ),
+            internal_timestep_seconds: 300,
+            output_dir: std::path::PathBuf::from("./tests/invalid_test/outputs/troute"),
+            kernel: muskingum::MuskingumCungeKernel::TRouteModernized,
+            num_threads: 1,
+            flow_source: csv_source("./tests/invalid_test/outputs/ngen"),
+        };
+        let result = run_routing(invalid_config, true);
+        assert!(result.is_err());
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("Failed to open database:")
+        );
+    }
+}
