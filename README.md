@@ -93,6 +93,24 @@ throughput:
 | `-k route-rs-simd` | 3.3x (AVX2), 4.0x (AVX-512) | 99.9% of calls within 1e-4 of the scalar kernel |
 | `--fast-converge` | a further 1.45x | total flow shifted ~0.07% |
 
+**The SIMD kernel needs build flags to pay off.** A default `cargo build
+--release` targets baseline `x86-64`, which is SSE2 only, and the kernel then
+vectorises poorly:
+
+| `RUSTFLAGS` | SIMD speedup | Runs on |
+| --- | --- | --- |
+| *(none)* | 1.6x | anything x86-64 |
+| `-C target-cpu=x86-64-v3` | 3.3x | Haswell / Excavator (2015) and later |
+| `-C target-cpu=native` | 4.0x | **the build machine only** |
+
+These are not set for you, because a binary built with `native` will fault with
+SIGILL on an older CPU — which matters if you build inside a container and ship
+the image. Pick the level that matches where the binary will run:
+
+```bash
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
+```
+
 `route-rs-simd` routes 16 reaches per timestep in lockstep, so it helps most
 where the network is wide; when the wavefront narrows to fewer than 16 ready
 reaches the spare lanes idle. It also holds 16 nodes' inputs and results per

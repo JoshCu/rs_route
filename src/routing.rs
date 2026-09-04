@@ -61,7 +61,7 @@ fn prepare_node(
         .ok_or_else(|| anyhow::anyhow!("Node {} has no area defined", node_id))?;
 
     let mut external_flows =
-        load_external_flows(node.qlat_file.clone(), &node.id, Some(&"Q_OUT"), area)?;
+        load_external_flows(node.qlat_file.clone(), &node.id, Some("Q_OUT"), area)?;
 
     // The scheduler only releases a node once every upstream has completed, so
     // nothing can still be writing here. Take the buffer instead of holding the
@@ -388,19 +388,21 @@ fn finish_node(
     writer_tx: &Sender<WriterMessage>,
 ) -> Result<()> {
     // Pass full-resolution flow to downstream node
-    if let Some(node) = topology.nodes.get(&node_id) {
-        if let Some(downstream_node) = topology.nodes.get(&node.downstream_id) {
-            let mut buffer = downstream_node
-                .inflow_storage
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Failed to lock downstream buffer: {}", e))?;
-            if buffer.is_empty() {
-                buffer.resize(results.flow_data.len(), 0.0);
-            }
-            for (i, &flow) in results.flow_data.iter().enumerate() {
-                if i < buffer.len() {
-                    buffer[i] += flow;
-                }
+    if let Some(downstream_node) = topology
+        .nodes
+        .get(&node_id)
+        .and_then(|node| topology.nodes.get(&node.downstream_id))
+    {
+        let mut buffer = downstream_node
+            .inflow_storage
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock downstream buffer: {}", e))?;
+        if buffer.is_empty() {
+            buffer.resize(results.flow_data.len(), 0.0);
+        }
+        for (i, &flow) in results.flow_data.iter().enumerate() {
+            if i < buffer.len() {
+                buffer[i] += flow;
             }
         }
     }
