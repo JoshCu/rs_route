@@ -15,7 +15,7 @@ pub mod kernel {
 }
 
 use cli::get_args;
-use config::{ChannelParams, ColumnConfig, OutputFormat};
+use config::{ChannelParams, ColumnConfig, OutputFormat, EXTERNAL_TIMESTEP_SECONDS};
 use io::netcdf::init_netcdf_output;
 use routing::process_routing_parallel;
 
@@ -61,7 +61,7 @@ fn run_routing(config: cli::Config, quiet: bool) -> Result<()> {
     let start_time = reference_time;
     let end_time = start_time + Duration::seconds((3600 * max_external_steps) as i64);
 
-    let external_timestep_seconds = 3600;
+    let external_timestep_seconds = EXTERNAL_TIMESTEP_SECONDS;
     let downsampling = external_timestep_seconds / config.internal_timestep_seconds;
     let total_timesteps = max_external_steps * downsampling;
 

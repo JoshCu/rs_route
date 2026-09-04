@@ -93,6 +93,28 @@ throughput:
 | `-k route-rs-simd` | 3.3x (AVX2), 4.0x (AVX-512) | 99.9% of calls within 1e-4 of the scalar kernel |
 | `--fast-converge` | a further 1.45x | total flow shifted ~0.07% |
 
+**Check your internal timestep before anything else.** The default `-t 300`
+takes 12 kernel calls per reach per forcing hour. Coarsening it is the cheapest
+speedup available, because it is the same model and the same kernel — just
+fewer steps. Measured against `-t 300` over a storm across 2000 synthetic
+reaches, comparing hourly output:
+
+| `-t` | Speedup | Volume bias | NSE | Peak error (median / p99) |
+| --- | --- | --- | --- | --- |
+| 600 | 1.9x | -0.02% | 0.9996 | 0.02% / 1.1% |
+| 900 | 2.9x | -0.06% | 0.9993 | 0.04% / 2.1% |
+| 1800 | 5.4x | -0.18% | 0.9981 | 0.18% / 3.8% |
+| 3600 | 11.2x | -2.19% | 0.9565 | 0.70% / 22.6% |
+
+`-t 900` looks close to free; `-t 3600` (no sub-hourly stepping at all) does not.
+These are synthetic reaches with prescribed inflow, so errors do not compound
+through the network topology the way they will in a real domain — treat the
+table as a reason to test `-t` on your own basin, not as a calibration.
+
+`-t` must divide 3600 exactly, and values that do not are now rejected: the
+routing clock advances `3600 / dt` steps per forcing step, so `-t 700` would
+take 5 steps of 700 s per forcing hour and lose 100 s every hour.
+
 **The SIMD kernel needs build flags to pay off.** A default `cargo build
 --release` targets baseline `x86-64`, which is SSE2 only, and the kernel then
 vectorises poorly:

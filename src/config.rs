@@ -1,3 +1,10 @@
+/// Spacing of the ngen forcing files, and so of the routing output.
+///
+/// The internal routing timestep must divide this exactly: the simulation
+/// advances `3600 / internal_timestep_seconds` internal steps per forcing step,
+/// and if that division has a remainder the two clocks drift apart.
+pub const EXTERNAL_TIMESTEP_SECONDS: usize = 3600;
+
 // Configuration structure for column name mapping
 #[derive(Debug, Clone)]
 pub struct ColumnConfig {
