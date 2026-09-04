@@ -105,6 +105,39 @@ pub struct MuskingumCungeResult {
     pub x: f32,
 }
 
+/// Where the secant search for flow depth starts, as multiples of the previous
+/// timestep's depth.
+///
+/// The search is a root-find, so a bracket that already straddles the answer
+/// converges in fewer iterations. Depth changes little between timesteps, which
+/// is what makes the tight bracket viable.
+#[derive(Clone, Copy, Debug)]
+pub struct SecantBracket {
+    pub high: f32,
+    pub high_offset: f32,
+    pub low: f32,
+}
+
+impl SecantBracket {
+    /// What t-route uses: a deliberately wide +/-33% bracket. The default,
+    /// because it is what the Fortran kernels do.
+    pub const WIDE: Self = Self {
+        high: 1.33,
+        high_offset: 0.01,
+        low: 0.67,
+    };
+
+    /// A +/-6% bracket. Converges in fewer iterations, but because the solver
+    /// stops on a 1% relative change it also stops sooner, so depths are
+    /// slightly less converged. Measured over a storm across 2000 reaches:
+    /// 1.45x faster under the SIMD kernel, total flow shifted by 0.07%.
+    pub const TIGHT: Self = Self {
+        high: 1.06,
+        high_offset: 0.005,
+        low: 0.94,
+    };
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum MuskingumCungeKernel {
     //#[value(name="route-rs-kern")]
@@ -132,9 +165,24 @@ impl MuskingumCungeKernel {
         input: &MuskingumCungeInput,
         calculate_courant: bool,
     ) -> MuskingumCungeResult {
+        self.exec_with_bracket(input, calculate_courant, SecantBracket::WIDE)
+    }
+
+    /// As `exec`, but with control over the secant starting bracket. Only the
+    /// Rust kernels honour it; the Fortran and C kernels hard-code the wide one.
+    pub fn exec_with_bracket(
+        self,
+        input: &MuskingumCungeInput,
+        calculate_courant: bool,
+        bracket: SecantBracket,
+    ) -> MuskingumCungeResult {
         match self {
             MuskingumCungeKernel::RouteRs | MuskingumCungeKernel::RouteRsSimd => {
-                call_kernel!(mc_kernel::muskingum_cunge, input, calculate_courant)
+                mc_kernel::muskingum_cunge(
+                    input.qup, input.quc, input.qdp, input.ql, input.dt, input.s0, input.dx,
+                    input.n, input.cs, input.bw, input.tw, input.tw_cc, input.n_cc, input.depthp,
+                    calculate_courant, bracket,
+                )
             }
             MuskingumCungeKernel::TRouteModernized => call_kernel!(
                 t_route::fortran_modernized::submuskingcunge,

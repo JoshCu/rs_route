@@ -3,7 +3,9 @@ use crate::io::csv::load_external_flows;
 use crate::io::netcdf::write_batch;
 use crate::io::results::SimulationResults;
 use crate::kernel::muskingum::rs_route::mc_kernel_simd::{self, LANES, LaneParams};
-use crate::kernel::muskingum::{MuskingumCungeInput, MuskingumCungeKernel, MuskingumCungeResult};
+use crate::kernel::muskingum::{
+    MuskingumCungeInput, MuskingumCungeKernel, MuskingumCungeResult, SecantBracket,
+};
 use crate::network::NetworkTopology;
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
@@ -119,6 +121,7 @@ fn route_node_scalar(
     channel_params: &ChannelParams,
     max_timesteps: usize,
     dt: f32,
+    bracket: SecantBracket,
 ) -> SimulationResults {
     let mut results = SimulationResults::new(feature_id);
     results.flow_data.reserve(max_timesteps);
@@ -143,7 +146,7 @@ fn route_node_scalar(
             .copied()
             .unwrap_or(0.0);
 
-        let result: MuskingumCungeResult = kernel.exec(
+        let result: MuskingumCungeResult = kernel.exec_with_bracket(
             &MuskingumCungeInput {
                 dt,
                 qup,
@@ -162,6 +165,7 @@ fn route_node_scalar(
                 depthp: depth_p,
             },
             false,
+            bracket,
         );
 
         results.flow_data.push(result.qdc);
@@ -186,6 +190,7 @@ fn route_nodes_simd(
     batch: &[(u32, NodeWork, ChannelParams)],
     max_timesteps: usize,
     dt: f32,
+    bracket: SecantBracket,
 ) -> Vec<SimulationResults> {
     let params: Vec<ChannelParams> = batch.iter().map(|(_, _, p)| p.clone()).collect();
     let lane_params = LaneParams::build(dt, &params);
@@ -217,7 +222,8 @@ fn route_nodes_simd(
                 .unwrap_or(0.0);
         }
 
-        let (out, _iters) = mc_kernel_simd::step(&lane_params, &qup, &quc, &qdp, &ql, &depth_p);
+        let (out, _iters) =
+            mc_kernel_simd::step(&lane_params, &qup, &quc, &qdp, &ql, &depth_p, bracket);
 
         for lane in 0..batch.len() {
             results[lane].flow_data.push(out.qdc[lane]);
@@ -436,6 +442,7 @@ fn worker_thread(
     downsampling: usize,
     writer_tx: Sender<WriterMessage>,
     progress_bar: Arc<ProgressBar>,
+    bracket: SecantBracket,
 ) -> Result<()> {
     let batched = matches!(kernel, MuskingumCungeKernel::RouteRsSimd);
     let mut shutdown_after_batch = false;
@@ -486,7 +493,7 @@ fn worker_thread(
 
         if batched {
             for chunk in prepared.chunks(LANES) {
-                let results = route_nodes_simd(chunk, max_timesteps, dt);
+                let results = route_nodes_simd(chunk, max_timesteps, dt, bracket);
                 for ((node_id, _, _), r) in chunk.iter().zip(results) {
                     routed.push((*node_id, r));
                 }
@@ -495,7 +502,7 @@ fn worker_thread(
             for (node_id, work, params) in &prepared {
                 routed.push((
                     *node_id,
-                    route_node_scalar(kernel, *node_id, work, params, max_timesteps, dt),
+                    route_node_scalar(kernel, *node_id, work, params, max_timesteps, dt, bracket),
                 ));
             }
         }
@@ -535,6 +542,7 @@ pub fn process_routing_parallel(
     output_file: Arc<Mutex<FileMut>>,
     progress_bar: Arc<ProgressBar>,
     num_threads: usize,
+    bracket: SecantBracket,
 ) -> Result<()> {
     let total_nodes = topology.nodes.len();
     let topology_arc = topology;
@@ -576,6 +584,7 @@ pub fn process_routing_parallel(
                 downsampling,
                 writer,
                 pb,
+                bracket,
             ) {
                 eprintln!("Worker {} error: {}", i, e);
             }

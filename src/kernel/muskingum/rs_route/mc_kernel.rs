@@ -1,4 +1,4 @@
-use crate::kernel::muskingum::MuskingumCungeResult;
+use crate::kernel::muskingum::{MuskingumCungeResult, SecantBracket};
 
 /// Pure Rust Muskingum-Cunge routing implementation.
 ///
@@ -23,6 +23,7 @@ pub fn muskingum_cunge(
     n_cc: f32,               // mannings of compound
     depth_p: f32,            // depth of flow in channel
     calculate_courant: bool, // whether to calculate courant number
+    bracket: SecantBracket,  // where the secant search starts
 ) -> MuskingumCungeResult {
     // early exit if no flow
     if qdp <= 0.0 && ql <= 0.0 && qup <= 0.0 && quc <= 0.0 {
@@ -51,8 +52,8 @@ pub fn muskingum_cunge(
 
     let mut depthc = depth_p.max(0.0);
 
-    let mut h = (depthc * 1.33) + 0.01;
-    let mut h_0 = depthc * 0.67;
+    let mut h = (depthc * bracket.high) + bracket.high_offset;
+    let mut h_0 = depthc * bracket.low;
     let mut tries = 0;
     let mut maxiter = 100;
     let mindepth = 0.01;

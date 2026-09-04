@@ -112,6 +112,7 @@ fn run_routing(config: cli::Config, quiet: bool) -> Result<()> {
         netcdf_writer,
         Arc::new(pb),
         config.num_threads,
+        config.secant_bracket,
     )?;
 
     // Final flush for CSV
@@ -188,6 +189,7 @@ mod tests {
             output_dir: std::path::PathBuf::from("./tests/one_cat/outputs/troute"),
             kernel: muskingum::MuskingumCungeKernel::TRouteModernized,
             num_threads: 1,
+            secant_bracket: muskingum::SecantBracket::WIDE,
         }
     }
 
@@ -514,6 +516,47 @@ mod tests {
         );
     }
 
+    /// --fast-converge trades convergence for speed, so it must stay a small
+    /// perturbation of the default rather than a different answer.
+    #[test]
+    fn test_fast_converge_stays_close_to_default() {
+        let mut flow_sums = Vec::new();
+
+        for bracket in [
+            muskingum::SecantBracket::WIDE,
+            muskingum::SecantBracket::TIGHT,
+        ] {
+            let tmp_dir = std::env::temp_dir()
+                .join(format!("rs_route_bracket_{}", bracket.high));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+
+            let config = cli::Config {
+                kernel: MuskingumCungeKernel::RouteRsSimd,
+                output_dir: tmp_dir.clone(),
+                secant_bracket: bracket,
+                ..setup_test_config()
+            };
+            assert!(run_routing(config, true).is_ok());
+
+            let nc_path = tmp_dir.join("troute_output_201001010000.nc");
+            let file = netcdf::open(&nc_path).unwrap();
+            let flow = file.variable("flow").unwrap().get::<f32, _>(..).unwrap();
+            flow_sums.push(flow.iter().map(|&v| v as f64).sum::<f64>());
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        let (wide, tight) = (flow_sums[0], flow_sums[1]);
+        assert!(wide > 0.0, "default bracket produced no flow");
+        let diff = ((tight - wide) / wide).abs();
+        assert!(
+            diff < 0.02,
+            "fast-converge shifted total flow by {:.3}% ({} vs {})",
+            diff * 100.0,
+            tight,
+            wide
+        );
+    }
+
     #[test]
     fn test_run_invalid_config() {
         // Test that run_routing returns an error when given an invalid configuration (e.g. non-existent database file)
@@ -526,6 +569,7 @@ mod tests {
             output_dir: std::path::PathBuf::from("./tests/invalid_test/outputs/troute"),
             kernel: muskingum::MuskingumCungeKernel::TRouteModernized,
             num_threads: 1,
+            secant_bracket: muskingum::SecantBracket::WIDE,
         };
         let result = run_routing(invalid_config, true);
         assert!(result.is_err());

@@ -36,6 +36,7 @@
 //! meaningful, which is what the routing tests assert.
 
 use crate::config::ChannelParams;
+use crate::kernel::muskingum::SecantBracket;
 
 /// One AVX-512 register of f32, or two AVX2 registers.
 pub const LANES: usize = 16;
@@ -243,6 +244,7 @@ pub fn step(
     qdp: &Lane,
     ql: &Lane,
     depth_p: &Lane,
+    bracket: SecantBracket,
 ) -> (LaneResult, u32) {
     let dt = p.dt;
     let mut dt_half = [0.0f32; LANES];
@@ -254,8 +256,8 @@ pub fn step(
     let mut h_0 = [0.0f32; LANES];
     for i in 0..LANES {
         let d = depth_p[i].max(0.0);
-        h[i] = d * 1.33 + 0.01;
-        h_0[i] = d * 0.67;
+        h[i] = d * bracket.high + bracket.high_offset;
+        h_0[i] = d * bracket.low;
     }
 
     let mut c1 = [0.0f32; LANES];
@@ -507,7 +509,7 @@ mod tests {
                 ql[i] = shape * scale;
             }
 
-            let (out, _) = step(&lane_params, &qup, &quc, &qdp, &ql, &depth_p);
+            let (out, _) = step(&lane_params, &qup, &quc, &qdp, &ql, &depth_p, SecantBracket::WIDE);
 
             for i in 0..LANES {
                 let p = &reaches[i];
@@ -515,6 +517,7 @@ mod tests {
                 let r = mc_kernel::muskingum_cunge(
                     qup[i], quc[i], qdp[i], ql[i], dt, s0, p.dx, p.n, p.cs, p.bw, p.tw, p.twcc,
                     p.ncc, depth_p[i], false,
+                SecantBracket::WIDE,
                 );
 
                 let rel = |scalar: f32, simd: f32| {
@@ -562,6 +565,7 @@ mod tests {
                 let r = mc_kernel::muskingum_cunge(
                     qup[i], quc[i], qdp[i], ql[i], dt, s0, p.dx, p.n, p.cs, p.bw, p.tw, p.twcc,
                     p.ncc, depth_p[i], false,
+                SecantBracket::WIDE,
                 );
                 qup[i] = quc[i];
                 qdp[i] = r.qdc;
@@ -616,10 +620,12 @@ mod tests {
                 let a = mc_kernel::muskingum_cunge(
                     a_qup, quc, a_qdp, ql, dt, s0, p.dx, p.n, p.cs, p.bw, p.tw, p.twcc, p.ncc,
                     a_dp, false,
+                SecantBracket::WIDE,
                 );
                 let b = mc_kernel::muskingum_cunge(
                     b_qup, quc, b_qdp, ql, dt, s0, p.dx, p.n, p.cs, p.bw, p.tw, p.twcc, p.ncc,
                     b_dp, false,
+                SecantBracket::WIDE,
                 );
 
                 if a.qdc.abs() > 1e-6 || b.qdc.abs() > 1e-6 {
@@ -662,8 +668,8 @@ mod tests {
         }
         let zero = [0.0f32; LANES];
 
-        let (a, _) = step(&full, &zero, &quc, &zero, &ql, &zero);
-        let (b, _) = step(&partial, &zero, &quc, &zero, &ql, &zero);
+        let (a, _) = step(&full, &zero, &quc, &zero, &ql, &zero, SecantBracket::WIDE);
+        let (b, _) = step(&partial, &zero, &quc, &zero, &ql, &zero, SecantBracket::WIDE);
 
         for i in 0..3 {
             assert_eq!(a.qdc[i].to_bits(), b.qdc[i].to_bits(), "lane {} flow", i);

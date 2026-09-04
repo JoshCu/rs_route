@@ -1,4 +1,4 @@
-use crate::kernel::muskingum::MuskingumCungeKernel;
+use crate::kernel::muskingum::{MuskingumCungeKernel, SecantBracket};
 use anyhow::{Context, Result};
 use clap::Parser;
 use colored::Colorize;
@@ -30,12 +30,21 @@ struct Args {
     kernel: MuskingumCungeKernel,
     #[arg(short, long, default_value_t = num_cpus::get())]
     num_threads: usize,
+
+    /// Start the depth solver from a tighter bracket. Converges in fewer
+    /// iterations, so depths are slightly less converged: ~1.45x faster with
+    /// the SIMD kernel, total flow shifted by ~0.07%. Rust kernels only.
+    #[arg(long, default_value_t = false)]
+    fast_converge: bool,
 }
 pub fn print_banner(config: &Config) {
     eprintln!("   {}", "🌊 Route RS".cyan().bold());
     eprintln!("  Kernel:   {}", format!("{}", config.kernel).green());
     eprintln!("  Timestep: {}s", config.internal_timestep_seconds);
     eprintln!("  Threads:  {}", config.num_threads);
+    if config.secant_bracket.high < SecantBracket::WIDE.high {
+        eprintln!("  Solver:   {}", "fast-converge".yellow());
+    }
     eprintln!(
         "  GeoPackage: {}",
         config.gpkg_file.display().to_string().dimmed()
@@ -49,6 +58,7 @@ pub struct Config {
     pub output_dir: PathBuf,
     pub kernel: MuskingumCungeKernel,
     pub num_threads: usize,
+    pub secant_bracket: SecantBracket,
 }
 
 pub fn get_args() -> Result<Config> {
@@ -112,6 +122,11 @@ pub fn get_args() -> Result<Config> {
         output_dir,
         kernel: args.kernel,
         num_threads: args.num_threads,
+        secant_bracket: if args.fast_converge {
+            SecantBracket::TIGHT
+        } else {
+            SecantBracket::WIDE
+        },
     };
     print_banner(&cfg);
     Ok(cfg)
