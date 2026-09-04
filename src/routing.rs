@@ -2,6 +2,7 @@ use crate::config::ChannelParams;
 use crate::io::csv::load_external_flows;
 use crate::io::netcdf::write_batch;
 use crate::io::results::SimulationResults;
+use crate::kernel::muskingum::rs_route::mc_kernel_simd::{self, LANES, LaneParams};
 use crate::kernel::muskingum::{MuskingumCungeInput, MuskingumCungeKernel, MuskingumCungeResult};
 use crate::network::NetworkTopology;
 use anyhow::{Context, Result};
@@ -30,21 +31,28 @@ enum SchedulerMessage {
     Shutdown,
 }
 
-// Process all timesteps for a single node (unchanged)
-fn process_node_all_timesteps(
-    kernel: MuskingumCungeKernel,
+/// A node's resolved inputs: the upstream hydrograph and the lateral-flow
+/// series, both indexed by internal timestep.
+struct NodeWork {
+    inflow: Vec<f32>,
+    external: Vec<f32>,
+    /// Internal timesteps per external (forcing) timestep.
+    upsampling: usize,
+}
+
+/// Gather a node's inputs.
+///
+/// Returns `None` when the node has neither upstream inflow nor lateral flow,
+/// which routes to all zeros.
+fn prepare_node(
     node_id: &u32,
     topology: &NetworkTopology,
-    channel_params: &ChannelParams,
     max_timesteps: usize,
-    dt: f32,
-) -> Result<SimulationResults> {
+) -> Result<Option<NodeWork>> {
     let node = topology
         .nodes
         .get(node_id)
         .ok_or_else(|| anyhow::anyhow!("Node {} not found", node_id))?;
-
-    let mut results = SimulationResults::new(node.id);
 
     let area = node
         .area_sqkm
@@ -53,30 +61,27 @@ fn process_node_all_timesteps(
     let mut external_flows =
         load_external_flows(node.qlat_file.clone(), &node.id, Some(&"Q_OUT"), area)?;
 
-    let s0 = if channel_params.s0 == 0.0 {
-        0.00001
-    } else {
-        channel_params.s0
+    // The scheduler only releases a node once every upstream has completed, so
+    // nothing can still be writing here. Take the buffer instead of holding the
+    // lock for the whole routing pass; the caller used to clear it afterwards.
+    let mut inflow = {
+        let mut guard = node
+            .inflow_storage
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to lock inflow storage: {}", e))?;
+        std::mem::take(&mut *guard)
     };
-    let mut inflow = node
-        .inflow_storage
-        .lock()
-        .map_err(|e| anyhow::anyhow!("Failed to lock inflow storage: {}", e))?;
 
-    if inflow.len() == 0 && external_flows.len() == 0 {
-        // if these are both empty then just return all zeros to the results
-        results.flow_data = vec![0.0; max_timesteps];
-        results.velocity_data = vec![0.0; max_timesteps];
-        results.depth_data = vec![0.0; max_timesteps];
-        return Ok(results);
+    if inflow.is_empty() && external_flows.is_empty() {
+        return Ok(None);
     }
 
     // if headwater then upstream inflow is 0.0
-    if inflow.len() == 0 {
+    if inflow.is_empty() {
         inflow.resize(max_timesteps, 0.0);
     }
 
-    if external_flows.len() == 0 {
+    if external_flows.is_empty() {
         external_flows.resize(max_timesteps, 0.0);
     } else if external_flows.len() == 1 {
         // Only a single external flow value breaks the upsampling logic,
@@ -88,26 +93,55 @@ fn process_node_all_timesteps(
         )).with_context(|| format!("Failed to load external flows for node {}: {:?}", node_id, node.qlat_file));
     }
 
+    // -1 because the input files have one additional timestep
+    let upsampling = (max_timesteps / (external_flows.len() - 1)).max(1);
+
+    Ok(Some(NodeWork {
+        inflow: Vec::from(inflow),
+        external: Vec::from(external_flows),
+        upsampling,
+    }))
+}
+
+fn zero_results(feature_id: u32, max_timesteps: usize) -> SimulationResults {
+    let mut results = SimulationResults::new(feature_id);
+    results.flow_data = vec![0.0; max_timesteps];
+    results.velocity_data = vec![0.0; max_timesteps];
+    results.depth_data = vec![0.0; max_timesteps];
+    results
+}
+
+/// Route one node, one timestep at a time, through the selected scalar kernel.
+fn route_node_scalar(
+    kernel: MuskingumCungeKernel,
+    feature_id: u32,
+    work: &NodeWork,
+    channel_params: &ChannelParams,
+    max_timesteps: usize,
+    dt: f32,
+) -> SimulationResults {
+    let mut results = SimulationResults::new(feature_id);
+    results.flow_data.reserve(max_timesteps);
+    results.velocity_data.reserve(max_timesteps);
+    results.depth_data.reserve(max_timesteps);
+
+    let s0 = if channel_params.s0 == 0.0 {
+        0.00001
+    } else {
+        channel_params.s0
+    };
+
     let mut qup = 0.0;
     let mut qdp = 0.0;
     let mut depth_p = 0.0;
-    // -1 because the input files have one additional timestep
-    let upsampling = max_timesteps / (external_flows.len() - 1);
 
-    let mut external_flow = 0.0;
-    // let mut upstream_flow = 0.0;
-
-    for _timestep in 0..max_timesteps {
-        if _timestep % upsampling == 0 {
-            external_flow = external_flows.pop_front().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to fetch qlateral from file for: {} at timestep {}",
-                    node_id,
-                    _timestep
-                )
-            })?;
-        }
-        let upstream_flow = inflow.pop_front().unwrap();
+    for timestep in 0..max_timesteps {
+        let upstream_flow = work.inflow.get(timestep).copied().unwrap_or(0.0);
+        let external_flow = work
+            .external
+            .get(timestep / work.upsampling)
+            .copied()
+            .unwrap_or(0.0);
 
         let result: MuskingumCungeResult = kernel.exec(
             &MuskingumCungeInput {
@@ -129,35 +163,73 @@ fn process_node_all_timesteps(
             },
             false,
         );
-        let (qdc, velc, depthc) = (result.qdc, result.velc, result.depthc);
-        // let (qdc, velc, depthc, _, _, _) = mc_kernel::submuskingcunge(
-        //     qup,
-        //     upstream_flow,
-        //     qdp,
-        //     external_flow,
-        //     dt,
-        //     s0,
-        //     channel_params.dx,
-        //     channel_params.n,
-        //     channel_params.cs,
-        //     channel_params.bw,
-        //     channel_params.tw,
-        //     channel_params.twcc,
-        //     channel_params.ncc,
-        //     depth_p,
-        //     false,
-        // );
 
-        results.flow_data.push(qdc);
-        results.velocity_data.push(velc);
-        results.depth_data.push(depthc);
+        results.flow_data.push(result.qdc);
+        results.velocity_data.push(result.velc);
+        results.depth_data.push(result.depthc);
 
         qup = upstream_flow;
-        qdp = qdc;
-        depth_p = depthc;
+        qdp = result.qdc;
+        depth_p = result.depthc;
     }
 
-    Ok(results)
+    results
+}
+
+/// Route up to `LANES` independent nodes together, one timestep at a time.
+///
+/// The reaches in a batch have no dependency on each other -- the scheduler
+/// only ever releases nodes whose upstreams are all complete -- so they can be
+/// stepped in lockstep through the SIMD kernel. Short batches leave the spare
+/// lanes at zero flow, which the kernel retires immediately.
+fn route_nodes_simd(
+    batch: &[(u32, NodeWork, ChannelParams)],
+    max_timesteps: usize,
+    dt: f32,
+) -> Vec<SimulationResults> {
+    let params: Vec<ChannelParams> = batch.iter().map(|(_, _, p)| p.clone()).collect();
+    let lane_params = LaneParams::build(dt, &params);
+
+    let mut results: Vec<SimulationResults> = batch
+        .iter()
+        .map(|(id, _, _)| {
+            let mut r = SimulationResults::new(*id);
+            r.flow_data.reserve(max_timesteps);
+            r.velocity_data.reserve(max_timesteps);
+            r.depth_data.reserve(max_timesteps);
+            r
+        })
+        .collect();
+
+    let mut qup = [0.0f32; LANES];
+    let mut qdp = [0.0f32; LANES];
+    let mut depth_p = [0.0f32; LANES];
+
+    for timestep in 0..max_timesteps {
+        let mut quc = [0.0f32; LANES];
+        let mut ql = [0.0f32; LANES];
+        for (lane, (_, work, _)) in batch.iter().enumerate() {
+            quc[lane] = work.inflow.get(timestep).copied().unwrap_or(0.0);
+            ql[lane] = work
+                .external
+                .get(timestep / work.upsampling)
+                .copied()
+                .unwrap_or(0.0);
+        }
+
+        let (out, _iters) = mc_kernel_simd::step(&lane_params, &qup, &quc, &qdp, &ql, &depth_p);
+
+        for lane in 0..batch.len() {
+            results[lane].flow_data.push(out.qdc[lane]);
+            results[lane].velocity_data.push(out.velc[lane]);
+            results[lane].depth_data.push(out.depthc[lane]);
+            qup[lane] = quc[lane];
+            qdp[lane] = out.qdc[lane];
+            depth_p[lane] = out.depthc[lane];
+        }
+    }
+
+    results
 }
 
 fn writer_thread(
@@ -301,6 +373,58 @@ fn downsample_results(results: SimulationResults, downsampling: usize) -> Simula
 }
 
 // Worker thread - now just receives work and processes it
+/// Hand a finished node's results downstream and on to the writer.
+fn finish_node(
+    node_id: u32,
+    results: SimulationResults,
+    topology: &NetworkTopology,
+    downsampling: usize,
+    writer_tx: &Sender<WriterMessage>,
+) -> Result<()> {
+    // Pass full-resolution flow to downstream node
+    if let Some(node) = topology.nodes.get(&node_id) {
+        if let Some(downstream_node) = topology.nodes.get(&node.downstream_id) {
+            let mut buffer = downstream_node
+                .inflow_storage
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Failed to lock downstream buffer: {}", e))?;
+            if buffer.is_empty() {
+                buffer.resize(results.flow_data.len(), 0.0);
+            }
+            for (i, &flow) in results.flow_data.iter().enumerate() {
+                if i < buffer.len() {
+                    buffer[i] += flow;
+                }
+            }
+        }
+    }
+
+    // Downsample then send to writer
+    let downsampled = downsample_results(results, downsampling);
+    if let Err(e) = writer_tx.send(WriterMessage::WriteResults(Arc::new(downsampled))) {
+        eprintln!("Failed to send results to writer: {}", e);
+    }
+    Ok(())
+}
+
+fn report_node_error(node_id: u32, e: &anyhow::Error) {
+    let mut error_message = format!("Error processing node {}: {}", node_id, e);
+    // if error context, elaborate on it
+    if let Some(context) = e.chain().nth(1) {
+        error_message.push_str(&format!("\nContext: {}", context));
+    }
+    eprintln!("{}", error_message);
+}
+
+// Worker thread - receives ready nodes and routes them.
+//
+// The SIMD kernel routes `LANES` reaches at once, so under that kernel the
+// worker drains whatever else is already queued (up to a full batch) before
+// starting. Nodes arrive here only once all their upstreams are done, so
+// everything in a batch is independent by construction. When the frontier is
+// narrower than a full batch the spare lanes simply idle, which is why the
+// scalar path stays as the default.
+#[allow(clippy::too_many_arguments)]
 fn worker_thread(
     kernel: MuskingumCungeKernel,
     work_rx: Receiver<WorkerMessage>,
@@ -313,83 +437,88 @@ fn worker_thread(
     writer_tx: Sender<WriterMessage>,
     progress_bar: Arc<ProgressBar>,
 ) -> Result<()> {
+    let batched = matches!(kernel, MuskingumCungeKernel::RouteRsSimd);
+    let mut shutdown_after_batch = false;
+
     loop {
-        match work_rx.recv() {
-            Ok(WorkerMessage::ProcessNode(node_id)) => {
-                // Process the node
-                if let Some(params) = channel_params_map.get(&node_id) {
-                    match process_node_all_timesteps(
-                        kernel,
-                        &node_id,
-                        &topology,
-                        params,
-                        max_timesteps,
-                        dt,
-                    ) {
-                        Ok(results) => {
-                            // Pass full-resolution flow to downstream node
-                            if let Some(node) = topology.nodes.get(&node_id) {
-                                if let Some(downstream_node) =
-                                    topology.nodes.get(&node.downstream_id)
-                                {
-                                    let mut buffer =
-                                        downstream_node.inflow_storage.lock().map_err(|e| {
-                                            anyhow::anyhow!(
-                                                "Failed to lock downstream buffer: {}",
-                                                e
-                                            )
-                                        })?;
-                                    if buffer.is_empty() {
-                                        buffer.resize(results.flow_data.len(), 0.0);
-                                    }
-                                    for (i, &flow) in results.flow_data.iter().enumerate() {
-                                        if i < buffer.len() {
-                                            buffer[i] += flow;
-                                        }
-                                    }
-                                }
-
-                                // Free inflow storage memory
-                                let mut old_inflow = node.inflow_storage.lock().map_err(|e| {
-                                    anyhow::anyhow!("Failed to lock inflow storage: {}", e)
-                                })?;
-                                *old_inflow = VecDeque::new();
-                            }
-
-                            // Downsample then send to writer
-                            let downsampled = downsample_results(results, downsampling);
-                            if let Err(e) =
-                                writer_tx.send(WriterMessage::WriteResults(Arc::new(downsampled)))
-                            {
-                                eprintln!("Failed to send results to writer: {}", e);
-                            }
-                        }
-                        Err(e) => {
-                            let mut error_message =
-                                format!("Error processing node {}: {}", node_id, e);
-                            // if error context, elaborate on it
-                            if let Some(context) = e.chain().skip(1).next() {
-                                error_message.push_str(&format!("\nContext: {}", context));
-                            }
-                            eprintln!("{}", error_message);
-                            writer_tx.send(WriterMessage::Shutdown).ok();
-                            scheduler_tx.send(SchedulerMessage::Shutdown).ok();
-                        }
-                    }
-
-                    progress_bar.inc(1);
-                }
-
-                // Notify scheduler that node is complete
-                if let Err(e) = scheduler_tx.send(SchedulerMessage::NodeCompleted(node_id)) {
-                    eprintln!("Failed to notify scheduler of completion: {}", e);
-                }
-            }
+        let first = match work_rx.recv() {
+            Ok(WorkerMessage::ProcessNode(node_id)) => node_id,
             Ok(WorkerMessage::Shutdown) => break,
             Err(e) => {
                 eprintln!("Worker channel error: {}", e);
                 break;
             }
+        };
+
+        let mut node_ids = vec![first];
+        if batched {
+            while node_ids.len() < LANES {
+                match work_rx.try_recv() {
+                    Ok(WorkerMessage::ProcessNode(node_id)) => node_ids.push(node_id),
+                    Ok(WorkerMessage::Shutdown) => {
+                        shutdown_after_batch = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Resolve inputs first; nodes with no forcing at all route to zeros
+        // without entering a kernel.
+        let mut prepared: Vec<(u32, NodeWork, ChannelParams)> = Vec::with_capacity(node_ids.len());
+        let mut routed: Vec<(u32, SimulationResults)> = Vec::with_capacity(node_ids.len());
+
+        for &node_id in &node_ids {
+            let Some(params) = channel_params_map.get(&node_id) else {
+                continue;
+            };
+            match prepare_node(&node_id, &topology, max_timesteps) {
+                Ok(None) => routed.push((node_id, zero_results(node_id, max_timesteps))),
+                Ok(Some(work)) => prepared.push((node_id, work, params.clone())),
+                Err(e) => {
+                    report_node_error(node_id, &e);
+                    writer_tx.send(WriterMessage::Shutdown).ok();
+                    scheduler_tx.send(SchedulerMessage::Shutdown).ok();
+                }
+            }
+        }
+
+        if batched {
+            for chunk in prepared.chunks(LANES) {
+                let results = route_nodes_simd(chunk, max_timesteps, dt);
+                for ((node_id, _, _), r) in chunk.iter().zip(results) {
+                    routed.push((*node_id, r));
+                }
+            }
+        } else {
+            for (node_id, work, params) in &prepared {
+                routed.push((
+                    *node_id,
+                    route_node_scalar(kernel, *node_id, work, params, max_timesteps, dt),
+                ));
+            }
+        }
+
+        for (node_id, results) in routed {
+            if let Err(e) = finish_node(node_id, results, &topology, downsampling, &writer_tx) {
+                report_node_error(node_id, &e);
+            }
+        }
+
+        // Every node handed to this worker counts as complete, including any
+        // skipped for missing channel parameters, or the scheduler stalls.
+        for node_id in node_ids {
+            if channel_params_map.contains_key(&node_id) {
+                progress_bar.inc(1);
+            }
+            if let Err(e) = scheduler_tx.send(SchedulerMessage::NodeCompleted(node_id)) {
+                eprintln!("Failed to notify scheduler of completion: {}", e);
+            }
+        }
+
+        if shutdown_after_batch {
+            break;
         }
     }
     Ok(())

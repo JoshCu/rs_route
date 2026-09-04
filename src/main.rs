@@ -472,6 +472,48 @@ mod tests {
         }
     }
 
+    /// The SIMD kernel routes 16 reaches per timestep in lockstep; it must
+    /// track the scalar Rust kernel over a full routing run. It uses an
+    /// approximate cube root in place of `powf(2.0 / 3.0)`, so the tolerance
+    /// here is looser than the cross-kernel checks above.
+    #[test]
+    fn test_simd_kernel_matches_scalar_full_routing() {
+        let mut flow_sums: Vec<(MuskingumCungeKernel, f64)> = Vec::new();
+
+        for kernel in [
+            MuskingumCungeKernel::RouteRs,
+            MuskingumCungeKernel::RouteRsSimd,
+        ] {
+            let tmp_dir = std::env::temp_dir().join(format!("rs_route_simd_{:?}", kernel));
+            std::fs::create_dir_all(&tmp_dir).unwrap();
+
+            let config = cli::Config {
+                kernel,
+                output_dir: tmp_dir.clone(),
+                ..setup_test_config()
+            };
+            assert!(run_routing(config, true).is_ok(), "kernel {:?} failed", kernel);
+
+            let nc_path = tmp_dir.join("troute_output_201001010000.nc");
+            let file = netcdf::open(&nc_path).unwrap();
+            let flow_data = file.variable("flow").unwrap().get::<f32, _>(..).unwrap();
+            flow_sums.push((kernel, flow_data.iter().map(|&v| v as f64).sum()));
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+
+        let (_, scalar) = flow_sums[0];
+        let (_, simd) = flow_sums[1];
+        assert!(scalar > 0.0, "scalar kernel produced no flow");
+        let diff = ((simd - scalar) / scalar).abs();
+        assert!(
+            diff < 0.001,
+            "SIMD total flow differs from scalar by {:.4}% ({} vs {})",
+            diff * 100.0,
+            simd,
+            scalar
+        );
+    }
+
     #[test]
     fn test_run_invalid_config() {
         // Test that run_routing returns an error when given an invalid configuration (e.g. non-existent database file)

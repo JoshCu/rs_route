@@ -8,6 +8,8 @@ pub mod t_route;
 pub mod rs_route {
     #[allow(clippy::too_many_arguments, non_snake_case, unused)]
     pub mod mc_kernel;
+    #[allow(clippy::too_many_arguments)]
+    pub mod mc_kernel_simd;
 }
 #[allow(clippy::too_many_arguments, non_snake_case)]
 pub mod c_mc;
@@ -107,6 +109,10 @@ pub struct MuskingumCungeResult {
 pub enum MuskingumCungeKernel {
     //#[value(name="route-rs-kern")]
     RouteRs,
+    /// Same maths as `RouteRs`, but routes 16 reaches per timestep in lockstep
+    /// so the dependent-FP chain is amortised across SIMD lanes. Requires the
+    /// batched path in `routing.rs`; falls back to `RouteRs` if called scalar.
+    RouteRsSimd,
     TRouteModernized,
     TRouteLegacy,
     CMuskingumCunge,
@@ -127,7 +133,7 @@ impl MuskingumCungeKernel {
         calculate_courant: bool,
     ) -> MuskingumCungeResult {
         match self {
-            MuskingumCungeKernel::RouteRs => {
+            MuskingumCungeKernel::RouteRs | MuskingumCungeKernel::RouteRsSimd => {
                 call_kernel!(mc_kernel::muskingum_cunge, input, calculate_courant)
             }
             MuskingumCungeKernel::TRouteModernized => call_kernel!(
@@ -166,6 +172,7 @@ impl Display for MuskingumCungeKernel {
             "{}",
             match self {
                 MuskingumCungeKernel::RouteRs => "route-rs",
+                MuskingumCungeKernel::RouteRsSimd => "route-rs-simd",
                 MuskingumCungeKernel::TRouteModernized => "t-route-modernized",
                 MuskingumCungeKernel::TRouteLegacy => "t-route-legacy",
                 MuskingumCungeKernel::CMuskingumCunge => "c-muskingum-cunge",
