@@ -108,13 +108,11 @@ pub fn init_netcdf_output(
 pub fn write_batch(
     output_file: &Arc<Mutex<FileMut>>,
     batch: &[Arc<SimulationResults>],
-    batch_num: usize,
+    start_idx: usize,
 ) -> Result<()> {
     let mut file = output_file
         .lock()
         .map_err(|e| anyhow::anyhow!("Failed to acquire NetCDF file lock: {}", e))?;
-
-    let start_idx = batch_num * batch.len();
 
     // Prepare all data arrays (already downsampled by workers)
     let mut all_feature_ids = Vec::with_capacity(batch.len());
@@ -129,15 +127,15 @@ pub fn write_batch(
         all_depths.extend_from_slice(&results.depth_data);
     }
 
+    let end_idx = start_idx + all_feature_ids.len();
+
     // Write all feature IDs at once
     let mut feature_var = file
         .variable_mut("feature_id")
         .ok_or_else(|| anyhow::anyhow!("feature_id variable not found"))?;
     feature_var
-        .put_values(&all_feature_ids, start_idx..)
+        .put_values(&all_feature_ids, start_idx..end_idx)
         .context("Failed to write feature_ids")?;
-
-    let end_idx = start_idx + all_feature_ids.len();
 
     // flow/velocity/depth are already flat in row-major (feature, time) order,
     // matching the variable layout, so each can be written in a single call.

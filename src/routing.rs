@@ -166,7 +166,10 @@ fn writer_thread(
     batch_size: usize, // e.g., 100 nodes
 ) -> Result<()> {
     let mut batch = Vec::new();
-    let mut batch_num = 0;
+    // Index of the next feature row to write. Batches can be flushed early (on
+    // timeout) with fewer than batch_size entries, so the write offset has to be
+    // advanced by the number of features actually written, not batch_size.
+    let mut next_feature_idx = 0;
 
     loop {
         match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -175,30 +178,30 @@ fn writer_thread(
 
                 // Write when batch is full
                 if batch.len() >= batch_size {
-                    write_batch(&output_file, &batch, batch_num)?;
+                    write_batch(&output_file, &batch, next_feature_idx)?;
+                    next_feature_idx += batch.len();
                     batch.clear();
-                    batch_num += 1;
                 }
             }
             Ok(WriterMessage::Shutdown) => {
                 // Write remaining batch
                 if !batch.is_empty() {
-                    write_batch(&output_file, &batch, batch_num)?;
+                    write_batch(&output_file, &batch, next_feature_idx)?;
                 }
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Write partial batch on timeout to avoid holding data too long
                 if !batch.is_empty() {
-                    write_batch(&output_file, &batch, batch_num)?;
+                    write_batch(&output_file, &batch, next_feature_idx)?;
+                    next_feature_idx += batch.len();
                     batch.clear();
-                    batch_num += 1;
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // All senders dropped — normal shutdown
                 if !batch.is_empty() {
-                    write_batch(&output_file, &batch, batch_num)?;
+                    write_batch(&output_file, &batch, next_feature_idx)?;
                 }
                 break;
             }
